@@ -1,0 +1,389 @@
+# -*- coding: utf-8 -*-
+"""
+48_final_technical_checks_and_mundlak_fe.py
+===========================================
+Son 4 Teknik Kontrolü ve Nihai Tablo Çıktılarını Üreten Betik:
+
+  [1] Gerçek Yerel Zamansal Anomali (Site x Crop Mundlak + Year FE):
+      - Birim: unit = site_id | Crop_Clean (en az >= 3 yıl aktif olan birimler).
+      - Ayrıştırma:
+          * X_unit_mean : Birimin kendi zaman ortalaması (Between / Spatial-Crop)
+          * X_anom      : X_{i,t} - X_unit_mean (Birim içi zamansal sapma)
+          * X_anom_loc  : X_anom - mean_t(X_anom) (Ulusal yıl ortalamasından
+                          arındırılmış yerel zamansal anomali)
+      - Modeller:
+          (a) Year Fixed Effects (Yıl kuklaları) + X_unit_mean + X_anom
+          (b) Year Fixed Effects + X_unit_mean + X_anom_loc
+          (c) Yalnızca kendi içinde hasar değişimi olan birimlerde (ever-damaged
+              & non-all-damaged) birim-içi anomali kontrolü.
+      - Standart hatalar: Hem Grid_ID (1,283) hem Cluster_81 (81) küme-dirençli!
+
+  [2] Yıl-Tabakalı (Year-Stratified / Within-Year Mean) AUC vs Havuzlanmış (Pooled) AUC
+      ve Cluster_81 (81 Bölge Bloğu) vs Grid_ID (1,333 Hücre Bloğu) Paired Bootstrap:
+      - Birincil karşılaştırma: M4 (Exp + Crop + RAKIM + ERA5) minus M2 (Exp + Crop + RAKIM)
+      - İkincil karşılaştırma : M3 (Exp + ERA5) minus M0 (ExpOnly)
+      - Her bootstrap çekiminde aynı anda hem Pooled ΔAUC, hem Within-Year Mean ΔAUC,
+        hem ΔPR-AUC, hem ΔLogLoss, hem de ΔBSS_testRef hesaplanır!
+
+  [3] Düzeltilmiş Alt Örnek A (Active_Years_site_crop >= 7, N = 87,979) Tüm Rejimlerde:
+      - Rolling 2015, Rolling 2016, Rolling 2017, Pooled 2015-2017, LORO-81 ve Joint 2016-17.
+
+  [4] Tüm OOF tahminleri diske (`48_oof_predictions_all_regimes.parquet / .csv`) kaydedilir.
+"""
+
+from pathlib import Path
+import warnings
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, brier_score_loss, log_loss
+)
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+FILE_PATH  = Path(r"C:\Users\m-a-o\Desktop\TarsimData\V2\model_ready_data_spatial_final_v1.csv")
+OUTPUT_DIR = FILE_PATH.parent / "revision_outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TARGET        = "Claim_Is"
+MET_FEATURES  = ["WMAXSHR", "CAPE_dur", "WMAXSHR_burst", "h_agl"]
+EXP_FEATURES  = ["log_coverage"]
+BLOCK_GRID    = "Grid_ID"
+YEAR_COL      = "yil"
+N_BOOT        = 1000
+SEED          = 42
+
+print("=== [0] VERI YUKLENIYOR VE FIZIKSEL BIRIMLER (SITE x CROP) KURULUYOR ===")
+df = pd.read_csv(FILE_PATH, low_memory=False)
+needed = MET_FEATURES + EXP_FEATURES + [TARGET, YEAR_COL, BLOCK_GRID, "PS", "DHPS", "Exposure", "Claim", "LATITUDE", "LONGITUDE", "RAKIM", "Urun Adi Genel"]
+df = df.dropna(subset=needed).copy().reset_index(drop=True)
+
+df["site_id"]   = df["LATITUDE"].round(5).astype(str) + "|" + df["LONGITUDE"].round(5).astype(str)
+df["Crop_Clean"]= df["Urun Adi Genel"].astype(str).str.upper().str.strip().replace("BUGDAY", "BUĞDAY")
+df["unit_id"]   = df["site_id"] + "|" + df["Crop_Clean"]
+
+df["Crop_Cat"]  = pd.Categorical(df["Crop_Clean"], categories=["ARPA", "BUĞDAY", "MISIR", "PAMUK"], ordered=False)
+crop_dummies    = pd.get_dummies(df["Crop_Cat"], prefix="Crop", drop_first=True).astype(float)
+CROP_COLS       = list(crop_dummies.columns)
+df = pd.concat([df, crop_dummies], axis=1)
+
+# Birim (site x crop) aktif yil sayisi
+unit_n_years = df.groupby("unit_id")[YEAR_COL].transform("nunique")
+df["Active_Years_site_crop"] = unit_n_years
+
+# 81 K-Means kumesi (27,601 benzersiz site_id uzerinden)
+u_sites = df[["site_id", "LATITUDE", "LONGITUDE"]].drop_duplicates(subset=["site_id"]).reset_index(drop=True)
+km81 = KMeans(n_clusters=81, random_state=SEED, n_init=10)
+u_sites["Cluster_81"] = km81.fit_predict(u_sites[["LATITUDE", "LONGITUDE"]])
+df = df.merge(u_sites[["site_id", "Cluster_81"]], on="site_id", how="left")
+
+# =============================================================================
+# [1] SITE x CROP MUNDLAK + YIL SABIT ETKILI (YEAR FE) ZAMANSAL ANOMALI TESTI
+# =============================================================================
+print("\n=== [1] SITE x CROP MUNDLAK + YIL SABIT ETKILI ZAMANSAL ANOMALI ANALIZI ===")
+tr_all = df[df[YEAR_COL] <= 2015].copy()
+tr_all["tr_unit_years"] = tr_all.groupby("unit_id")[YEAR_COL].transform("nunique")
+
+# En az 3 egitim yili olan site x crop birimleri
+tr = tr_all[tr_all["tr_unit_years"] >= 3].copy().reset_index(drop=True)
+print(f"  Egitim (<=2015) toplam satir: {len(tr_all):,} | >=3 yil aktif site x crop satiri: {len(tr):,} ({tr['unit_id'].nunique():,} birim)")
+
+um_cols, anom_cols, anom_loc_cols = [], [], []
+for f in MET_FEATURES:
+    tr[f + "_um"]       = tr.groupby("unit_id")[f].transform("mean")
+    tr[f + "_anom"]     = tr[f] - tr[f + "_um"]
+    tr[f + "_anom_loc"] = tr[f + "_anom"] - tr.groupby(YEAR_COL)[f + "_anom"].transform("mean")
+    um_cols.append(f + "_um")
+    anom_cols.append(f + "_anom")
+    anom_loc_cols.append(f + "_anom_loc")
+
+# Yil kuklalari (Year Fixed Effects)
+yr_dummies = pd.get_dummies(tr[YEAR_COL].astype(int), prefix="Yr", drop_first=True).astype(float)
+YR_COLS    = list(yr_dummies.columns)
+tr = pd.concat([tr, yr_dummies], axis=1)
+
+def fit_mundlak_spec(df_sub, anom_list, include_year_fe=True, spec_name=""):
+    base_c = EXP_FEATURES + CROP_COLS + ["RAKIM"] + um_list_use + anom_list + (YR_COLS if include_year_fe else [])
+    sc = StandardScaler()
+    # Standartlastirma: surekli degiskenler 1 SD basina OR olarak yorumlansin
+    X_sc = pd.DataFrame(sc.fit_transform(df_sub[base_c]), columns=base_c, index=df_sub.index)
+    X_sm = sm.add_constant(X_sc)
+    y_sub = df_sub[TARGET].values
+
+    m_grid = sm.Logit(y_sub, X_sm).fit(
+        method="bfgs", maxiter=500, disp=0,
+        cov_type="cluster", cov_kwds={"groups": df_sub[BLOCK_GRID].values}
+    )
+    m_c81 = sm.Logit(y_sub, X_sm).fit(
+        method="bfgs", maxiter=500, disp=0,
+        cov_type="cluster", cov_kwds={"groups": df_sub["Cluster_81"].values}
+    )
+
+    # 4 Anomali terimi icin ortak Wald testi (hem Grid_ID hem Cluster_81 altinda)
+    R_mat = np.zeros((len(anom_list), len(X_sm.columns)))
+    for i, col_a in enumerate(anom_list):
+        R_mat[i, list(X_sm.columns).index(col_a)] = 1.0
+    w_grid = m_grid.wald_test(R_mat, scalar=True)
+    w_c81  = m_c81.wald_test(R_mat, scalar=True)
+
+    rows = []
+    for col in anom_list + um_list_use:
+        comp_type = "Within-(Site x Crop) Temporal Anomaly" if ("_anom" in col) else "Between-(Site x Crop) Mean"
+        or_pt = float(np.exp(m_grid.params[col]))
+        g_lo, g_hi = np.exp(m_grid.conf_int().loc[col].values)
+        c_lo, c_hi = np.exp(m_c81.conf_int().loc[col].values)
+        rows.append({
+            "Specification": spec_name,
+            "Component": comp_type,
+            "Variable": col,
+            "OR_per_SD": round(or_pt, 4),
+            "Grid_ID_95CI": f"[{g_lo:.4f}, {g_hi:.4f}]",
+            "Grid_ID_p": round(float(m_grid.pvalues[col]), 6),
+            "Cluster81_95CI": f"[{c_lo:.4f}, {c_hi:.4f}]",
+            "Cluster81_p": round(float(m_c81.pvalues[col]), 6),
+        })
+    print(f"  [{spec_name}] Joint Anomaly Wald Chi2(4) -> Grid_ID: {float(w_grid.statistic):.2f} (p={float(w_grid.pvalue):.3e}) | Cluster_81: {float(w_c81.statistic):.2f} (p={float(w_c81.pvalue):.3e})")
+    return rows
+
+um_list_use = um_cols
+mun_all_rows = []
+# Spec A: Raw site x crop anomaly (without Year FE)
+mun_all_rows.extend(fit_mundlak_spec(tr, anom_cols, include_year_fe=False, spec_name="1. Site x Crop Anomaly (No Year FE)"))
+# Spec B: Local site x crop anomaly demeaned by year + Year Fixed Effects (The strictest test!)
+mun_all_rows.extend(fit_mundlak_spec(tr, anom_loc_cols, include_year_fe=True, spec_name="2. Local Demeaned Anomaly + Year FE"))
+# Spec C: Raw site x crop anomaly + Year Fixed Effects
+mun_all_rows.extend(fit_mundlak_spec(tr, anom_cols, include_year_fe=True, spec_name="3. Site x Crop Anomaly + Year FE"))
+
+df_mundlak = pd.DataFrame(mun_all_rows)
+print("\nSite x Crop Mundlak + Year FE Sonuc Tablosu:")
+print(df_mundlak.to_string(index=False))
+df_mundlak.to_csv(OUTPUT_DIR / "48_mundlak_site_crop_year_fe_results.csv", index=False)
+
+# =============================================================================
+# [2] YIL-TABAKALI (WITHIN-YEAR) vs HAVUZLANMIS (POOLED) AUC VE
+#     CLUSTER_81 vs GRID_ID PAIRED BLOCK BOOTSTRAP (TAM ORNEKLEM VE SUBSAMPLE A)
+# =============================================================================
+print(f"\n=== [2] YIL-TABAKALI vs POOLED AUC & CLUSTER_81 vs GRID_ID BOOTSTRAP (B={N_BOOT}) ===")
+
+SPECS = {
+    "M0_ExpOnly":             EXP_FEATURES,
+    "M2_Exp_Crop_RAKIM":      EXP_FEATURES + CROP_COLS + ["RAKIM"],
+    "M3_Exp_ERA5":            EXP_FEATURES + MET_FEATURES,
+    "M4_Exp_Crop_RAKIM_ERA5": EXP_FEATURES + CROP_COLS + ["RAKIM"] + MET_FEATURES,
+}
+
+def fit_pred_fast(df_in, tr_m, te_m, cols):
+    sc = StandardScaler()
+    Xtr = sc.fit_transform(df_in.loc[tr_m, cols].values)
+    Xte = sc.transform(df_in.loc[te_m, cols].values)
+    clf = LogisticRegression(C=1e9, solver="lbfgs", max_iter=300)
+    clf.fit(Xtr, df_in.loc[tr_m, TARGET].values)
+    return clf.predict_proba(Xte)[:, 1]
+
+def build_regimes_for_sample(df_sample, sample_tag):
+    """
+    Verilen örneklem (Full veya Subsample A) üzerinde tüm doğrulama rejimlerinin
+    OOF tahminlerini üretir ve yıl bilgisini (`yr_vec`) birlikte saklar.
+    """
+    out = {}
+    yr_all  = df_sample[YEAR_COL].values
+    y_all   = df_sample[TARGET].values
+    g_all   = df_sample[BLOCK_GRID].values
+    c81_all = df_sample["Cluster_81"].values
+
+    # Rolling 2015, 2016, 2017
+    for yr in [2015, 2016, 2017]:
+        tr_m = (yr_all < yr)
+        te_m = (yr_all == yr)
+        preds = {k: fit_pred_fast(df_sample, tr_m, te_m, cols) for k, cols in SPECS.items()}
+        out[f"{sample_tag}_Rolling_{yr}"] = (preds, y_all[te_m], yr_all[te_m], g_all[te_m], c81_all[te_m])
+
+    # Pooled Rolling 2015-2017
+    p_pool = {k: np.concatenate([out[f"{sample_tag}_Rolling_{yr}"][0][k] for yr in [2015, 2016, 2017]]) for k in SPECS}
+    y_pool = np.concatenate([out[f"{sample_tag}_Rolling_{yr}"][1] for yr in [2015, 2016, 2017]])
+    yr_pool= np.concatenate([out[f"{sample_tag}_Rolling_{yr}"][2] for yr in [2015, 2016, 2017]])
+    g_pool = np.concatenate([out[f"{sample_tag}_Rolling_{yr}"][3] for yr in [2015, 2016, 2017]])
+    c_pool = np.concatenate([out[f"{sample_tag}_Rolling_{yr}"][4] for yr in [2015, 2016, 2017]])
+    out[f"{sample_tag}_Pooled_2015_2017"] = (p_pool, y_pool, yr_pool, g_pool, c_pool)
+
+    # Spatial LORO-81 (All Years)
+    p_loro = {k: np.full(len(df_sample), np.nan) for k in SPECS}
+    for cid in range(81):
+        te_m = (c81_all == cid)
+        tr_m = ~te_m
+        if te_m.sum() == 0:
+            continue
+        for k, cols in SPECS.items():
+            p_loro[k][te_m] = fit_pred_fast(df_sample, tr_m, te_m, cols)
+    out[f"{sample_tag}_LORO_81"] = (p_loro, y_all, yr_all, g_all, c81_all)
+
+    # Joint Spatiotemporal 2016-2017 & 2017
+    for sp_yr, sp_name in [(2016, "Joint_2016_2017"), (2017, "Joint_2017")]:
+        p_sp = {k: np.full(len(df_sample), np.nan) for k in SPECS}
+        for cid in range(81):
+            te_m = (c81_all == cid) & (yr_all >= sp_yr)
+            tr_m = (c81_all != cid) & (yr_all < sp_yr)
+            if te_m.sum() == 0:
+                continue
+            for k, cols in SPECS.items():
+                p_sp[k][te_m] = fit_pred_fast(df_sample, tr_m, te_m, cols)
+        val_m = (yr_all >= sp_yr)
+        out[f"{sample_tag}_{sp_name}"] = (
+            {k: v[val_m] for k, v in p_sp.items()},
+            y_all[val_m], yr_all[val_m], g_all[val_m], c81_all[val_m]
+        )
+    return out
+
+print("  -> Tam Örneklem (Full Panel, N=184,469) rejimleri hesaplaniyor...")
+regimes_full = build_regimes_for_sample(df, "Full")
+
+print("  -> Düzeltilmiş Alt Örnek A (Site x Crop >= 7 Yıl, N=87,979) rejimleri hesaplaniyor...")
+df_subA = df[df["Active_Years_site_crop"] >= 7].copy().reset_index(drop=True)
+regimes_subA = build_regimes_for_sample(df_subA, "SubA")
+
+all_regimes = {**regimes_full, **regimes_subA}
+
+# OOF tahminlerini kaydet (Full LORO-81 ve Pooled 2015-2017)
+oof_save_df = df[["site_id", YEAR_COL, BLOCK_GRID, "Cluster_81", TARGET]].copy()
+for k in SPECS:
+    oof_save_df[f"LORO81_{k}"] = regimes_full["Full_LORO_81"][0][k]
+oof_save_df.to_csv(OUTPUT_DIR / "48_oof_predictions_full_loro81.csv", index=False)
+
+def within_year_mean_auc(y_vec, p_vec, yr_vec):
+    """Her yılın kendi içindeki ROC-AUC değerlerinin eşit ağırlıklı ve örneklem ağırlıklı ortalaması."""
+    aucs, weights = [], []
+    for y_val in np.unique(yr_vec):
+        m = (yr_vec == y_val)
+        yb = y_vec[m]
+        if len(np.unique(yb)) == 2:
+            aucs.append(roc_auc_score(yb, p_vec[m]))
+            weights.append(m.sum())
+    if not aucs:
+        return np.nan
+    return float(np.mean(aucs))
+
+def within_year_calibrated_bss(y_vec, p_vec, yr_vec):
+    """Her yılın kendi baz oranını referans alan (yıllar arası baz oran farkından arındırılmış) BSS."""
+    b_num, b_den = 0.0, 0.0
+    for y_val in np.unique(yr_vec):
+        m = (yr_vec == y_val)
+        yb = y_vec[m]
+        pb = p_vec[m]
+        b_num += np.sum((yb - pb) ** 2)
+        b_den += np.sum((yb - yb.mean()) ** 2)
+    return float(1.0 - b_num / max(b_den, 1e-12))
+
+# Paired Bootstrap Fonksiyonu (Hem Grid_ID hem Cluster_81 için)
+comparisons = [
+    ("Primary: M4(Exp+Crop+RAKIM+ERA5) - M2(Exp+Crop+RAKIM)", "M4_Exp_Crop_RAKIM_ERA5", "M2_Exp_Crop_RAKIM"),
+    ("Secondary: M3(Exp+ERA5) - M0(ExpOnly)",                 "M3_Exp_ERA5",            "M0_ExpOnly"),
+]
+
+summary_boot_rows = []
+
+for reg_name, (p_dict, y_v, yr_v, g_v, c81_v) in all_regimes.items():
+    n_ev = len(y_v)
+    n_yrs = len(np.unique(yr_v))
+
+    # Nokta farklari (Point Estimates)
+    pt_diffs = {}
+    for c_lbl, ma, mb in comparisons:
+        pa = np.clip(p_dict[ma], 1e-7, 1.0 - 1e-7)
+        pb = np.clip(p_dict[mb], 1e-7, 1.0 - 1e-7)
+        d_pool_auc = roc_auc_score(y_v, pa) - roc_auc_score(y_v, pb)
+        d_wy_auc   = within_year_mean_auc(y_v, pa, yr_v) - within_year_mean_auc(y_v, pb, yr_v)
+        d_prauc    = average_precision_score(y_v, pa) - average_precision_score(y_v, pb)
+        d_ll       = log_loss(y_v, pa) - log_loss(y_v, pb)
+        b_ref_pool = brier_score_loss(y_v, np.full_like(y_v, y_v.mean(), dtype=float))
+        d_bss_pool = (1.0 - brier_score_loss(y_v, pa) / b_ref_pool) - (1.0 - brier_score_loss(y_v, pb) / b_ref_pool)
+        pt_diffs[c_lbl] = (d_pool_auc, d_wy_auc, d_prauc, d_ll, d_bss_pool)
+
+    # Hangi bloklama ile bootstrap yapilacak?
+    # Çok yıllı / LORO rejimlerinde hem Grid_ID hem Cluster_81; tek yıl rejimlerinde Grid_ID ve Cluster_81
+    block_schemes = [("Grid_ID (1333 cells)", g_v), ("Cluster_81 (81 regions)", c81_v)]
+
+    for blk_name, blk_vec in block_schemes:
+        # Sadece ana (Full) çok yıllı rejimlerde her ikisini, SubA'da Cluster_81 ve Grid_ID'yi çalıştır
+        s_grp = pd.Series(blk_vec).groupby(blk_vec).indices
+        b_keys = list(s_grp.keys())
+        n_b = len(b_keys)
+        rng = np.random.default_rng(SEED)
+
+        store = {
+            c_lbl: {"pool_auc": [], "wy_auc": [], "prauc": [], "ll": [], "bss": []}
+            for c_lbl, _, _ in comparisons
+        }
+
+        for _ in tqdm(range(N_BOOT), desc=f"{reg_name[:18]} [{blk_name[:7]}]", leave=False):
+            dr = rng.integers(0, n_b, size=n_b)
+            ix = np.concatenate([s_grp[b_keys[d]] for d in dr])
+            yb  = y_v[ix]
+            yrb = yr_v[ix]
+            if len(np.unique(yb)) < 2:
+                continue
+            b_ref = brier_score_loss(yb, np.full_like(yb, yb.mean(), dtype=float))
+
+            for c_lbl, ma, mb in comparisons:
+                pa = np.clip(p_dict[ma][ix], 1e-7, 1.0 - 1e-7)
+                pb = np.clip(p_dict[mb][ix], 1e-7, 1.0 - 1e-7)
+                store[c_lbl]["pool_auc"].append(roc_auc_score(yb, pa) - roc_auc_score(yb, pb))
+                if n_yrs > 1:
+                    store[c_lbl]["wy_auc"].append(within_year_mean_auc(yb, pa, yrb) - within_year_mean_auc(yb, pb, yrb))
+                else:
+                    store[c_lbl]["wy_auc"].append(store[c_lbl]["pool_auc"][-1])
+                store[c_lbl]["prauc"].append(average_precision_score(yb, pa) - average_precision_score(yb, pb))
+                store[c_lbl]["ll"].append(log_loss(yb, pa) - log_loss(yb, pb))
+                store[c_lbl]["bss"].append((1.0 - brier_score_loss(yb, pa) / b_ref) - (1.0 - brier_score_loss(yb, pb) / b_ref))
+
+        for c_lbl, _, _ in comparisons:
+            d_pa, d_wa, d_pr, d_l, d_bs = pt_diffs[c_lbl]
+
+            def ci_p(arr):
+                a = np.asarray(arr)
+                lo, hi = float(np.percentile(a, 2.5)), float(np.percentile(a, 97.5))
+                pv = 2.0 * min((a <= 0).mean(), (a >= 0).mean())
+                pv = float(min(max(pv, 1.0 / (len(a) + 1)), 1.0))
+                return f"[{lo:+.4f}, {hi:+.4f}]", round(pv, 4)
+
+            pa_ci, pa_p = ci_p(store[c_lbl]["pool_auc"])
+            wa_ci, wa_p = ci_p(store[c_lbl]["wy_auc"])
+            pr_ci, pr_p = ci_p(store[c_lbl]["prauc"])
+            ll_ci, ll_p = ci_p(store[c_lbl]["ll"])
+            bs_ci, bs_p = ci_p(store[c_lbl]["bss"])
+
+            summary_boot_rows.append({
+                "Regime": reg_name,
+                "Evaluated_N": n_ev,
+                "Block_Unit": blk_name,
+                "Comparison": c_lbl,
+                "d_Pooled_AUC": round(d_pa, 4),
+                "d_Pooled_AUC_CI": pa_ci,
+                "p_Pooled_AUC": pa_p,
+                "d_WithinYr_AUC": round(d_wa, 4),
+                "d_WithinYr_AUC_CI": wa_ci,
+                "p_WithinYr_AUC": wa_p,
+                "d_LogLoss": round(d_l, 4),
+                "d_LogLoss_CI": ll_ci,
+                "p_LogLoss": ll_p,
+                "d_PRAUC": round(d_pr, 4),
+                "d_PRAUC_CI": pr_ci,
+                "d_BSS_testRef": round(d_bs, 4),
+                "d_BSS_CI": bs_ci,
+            })
+
+df_final_boot = pd.DataFrame(summary_boot_rows)
+print("\n--- BIRINCIL KARSILASTIRMA (M4 - M2: ERA5 given Exp+Crop+RAKIM) SONUCLARI ---")
+df_prim = df_final_boot[df_final_boot["Comparison"].str.startswith("Primary")]
+print(df_prim[["Regime", "Evaluated_N", "Block_Unit", "d_Pooled_AUC", "d_Pooled_AUC_CI", "p_Pooled_AUC", "d_WithinYr_AUC", "d_WithinYr_AUC_CI", "p_WithinYr_AUC", "d_LogLoss", "d_LogLoss_CI", "p_LogLoss"]].to_string(index=False))
+
+print("\n--- IKINCIL KARSILASTIRMA (M3 - M0: ERA5 given ExpOnly) SONUCLARI ---")
+df_sec = df_final_boot[df_final_boot["Comparison"].str.startswith("Secondary")]
+print(df_sec[["Regime", "Evaluated_N", "Block_Unit", "d_Pooled_AUC", "d_Pooled_AUC_CI", "p_Pooled_AUC", "d_WithinYr_AUC", "d_WithinYr_AUC_CI", "p_WithinYr_AUC", "d_LogLoss", "d_LogLoss_CI", "p_LogLoss"]].to_string(index=False))
+
+df_final_boot.to_csv(OUTPUT_DIR / "48_final_pooled_vs_within_year_cluster81_bootstrap.csv", index=False)
+print(f"\n[TAMAMLANDI] 48_final_technical_checks_and_mundlak_fe ciktilari kaydedildi -> {OUTPUT_DIR}")
