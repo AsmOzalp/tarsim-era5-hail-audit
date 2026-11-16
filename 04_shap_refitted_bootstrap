@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-30_shap_changepoint_refit_block.py
+04_shap_refitted_bootstrap.py
 ==================================
 Replaces 20_shap_changepoint_BOOTSTRAP_FIX.py.
 
